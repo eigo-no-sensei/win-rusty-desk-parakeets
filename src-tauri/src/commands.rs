@@ -41,11 +41,11 @@ pub async fn init_model(state: State<'_, AppState>) -> Result<TranscriptionResul
     }
 
     let exec_config = ExecutionConfig::new()
-        .with_execution_provider(ExecutionProvider::Cpu);
+    .with_execution_provider(ExecutionProvider::Cpu);
 
     let model = match parakeet_rs::ParakeetTDT::from_pretrained(
         state.model_dir.to_string_lossy().as_ref(),
-        Some(exec_config),
+                                                                Some(exec_config),
     ) {
         Ok(m) => m,
         Err(e) => {
@@ -62,9 +62,9 @@ pub async fn init_model(state: State<'_, AppState>) -> Result<TranscriptionResul
 
     Ok(TranscriptionResult {
         text: format!("Model loaded in {:.2}s", load_duration),
-        duration_secs: load_duration,
-        success: true,
-        error: None,
+       duration_secs: load_duration,
+       success: true,
+       error: None,
     })
 }
 
@@ -83,44 +83,68 @@ pub async fn transcribe_audio(
 
     let mut model_guard = state.model.lock().map_err(|e| e.to_string())?;
     let model = model_guard
-        .as_mut()
-        .ok_or_else(|| "Model not initialized. Call init_model first.".to_string())?;
+    .as_mut()
+    .ok_or_else(|| "Model not initialized. Call init_model first.".to_string())?;
 
-    // Decode and convert to 16 kHz mono
+    // Decode at native rate and channel count.
+    // NOTE: The new audio.rs implementation using ffmpeg-sidecar forces
+    // output to 16 kHz mono, so sample_rate and channels will be fixed values here.
     let decode_start = Instant::now();
-    let audio_data = crate::audio::decode_audio(&path)
-        .map_err(|e| format!("Failed to decode audio: {}", e))?;
 
-    let samples = audio_data.to_16k_mono();
+    let audio = crate::audio::decode_audio(&path)
+    .map_err(|e| format!("Failed to decode audio: {}", e))?;
+
+    let samples = audio.samples;
+    let sample_rate = audio.sample_rate;
+    let channels = audio.channels;
+
     let total_samples = samples.len();
     let decode_duration = decode_start.elapsed().as_secs_f64();
 
     info!(
-        "Decoded: {} samples ({:.1}s) in {:.2}s",
-        total_samples,
-        total_samples as f64 / 16_000.0,
-        decode_duration
+        "Decoded: {} samples @ {} Hz × {} ch ({:.1}s) in {:.2}s",
+          total_samples,
+          sample_rate,
+          channels,
+          total_samples as f64 / (sample_rate as f64 * channels as f64),
+          decode_duration,
     );
 
     // Chunk and transcribe
+    //
+    // Note on scaling: Since audio.rs decodes to 16000 Hz, rate_scale is 1.0.
+    // We keep the calculation logic here for robustness in case the decoder changes.
+    let chunk_samples = CHUNK_SAMPLES;
+    let overlap_samples = OVERLAP_SAMPLES;
+    let step = chunk_samples.saturating_sub(overlap_samples);
+    // Adjust time calculations to use 16_000.0 and 1 channel directly
+
     let transcribe_start = Instant::now();
     let mut parts: Vec<String> = Vec::new();
-    let step = CHUNK_SAMPLES.saturating_sub(OVERLAP_SAMPLES);
+    let step = chunk_samples.saturating_sub(overlap_samples);
     let mut offset = 0;
 
     while offset < total_samples {
-        let end = (offset + CHUNK_SAMPLES).min(total_samples);
+        let end = (offset + chunk_samples).min(total_samples);
         let chunk = samples[offset..end].to_vec();
-        let chunk_secs = chunk.len() as f64 / 16_000.0;
+
+        let time_start = offset as f64 / (sample_rate as f64 * channels as f64);
+        let time_end = end as f64 / (sample_rate as f64 * channels as f64);
 
         info!(
             "Chunk {:.1}s–{:.1}s ({} samples)",
-            offset as f64 / 16_000.0,
-            end as f64 / 16_000.0,
-            chunk.len()
+              time_start,
+              time_end,
+              chunk.len(),
         );
 
-        match model.transcribe_samples(chunk, 16_000, 1, Some(TimestampMode::Sentences)) {
+        // Fix: Cast u32 to u16 to match parakeet-rs signature
+        match model.transcribe_samples(
+            chunk,
+            sample_rate,
+            channels as u16,
+            Some(TimestampMode::Sentences)
+        ) {
             Ok(r) => {
                 let text = r.text.trim().to_string();
                 if !text.is_empty() {
@@ -129,7 +153,11 @@ pub async fn transcribe_audio(
             }
             Err(e) => {
                 error!("Chunk failed at offset {}: {}", offset, e);
-                return Err(format!("Transcription failed at {:.1}s: {}", offset as f64 / 16_000.0, e));
+                return Err(format!(
+                    "Transcription failed at {:.1}s: {}",
+                    time_start,
+                    e,
+                ));
             }
         }
 
@@ -146,8 +174,8 @@ pub async fn transcribe_audio(
     info!(
         "Done: {} chars from {} chunks in {:.2}s",
         full_text.len(),
-        parts.len(),
-        transcribe_duration
+          parts.len(),
+          transcribe_duration,
     );
 
     let mut transcript_guard = state.last_transcript.lock().map_err(|e| e.to_string())?;
@@ -155,9 +183,9 @@ pub async fn transcribe_audio(
 
     Ok(TranscriptionResult {
         text: full_text,
-        duration_secs: total_duration,
-        success: true,
-        error: None,
+       duration_secs: total_duration,
+       success: true,
+       error: None,
     })
 }
 

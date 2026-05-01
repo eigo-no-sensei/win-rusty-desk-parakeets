@@ -1,5 +1,5 @@
 //! Parakeet TDT Transcription App - Main Entry Point
-
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 use parakeet_tdt_app_lib::create_app_state;
 use tauri::Manager;
 use tracing::info;
